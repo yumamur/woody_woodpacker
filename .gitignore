@@ -1,0 +1,10 @@
+**
+**/**
+!.gitignore
+!.clang-format
+!**.c
+!**.h
+!Makefile
+!stub/
+!stub/*.asm
+stub.h

@@ -1,0 +1,42 @@
+Language: Cpp
+UseTab:                  Always
+TabWidth:                4
+IndentWidth:             4
+ContinuationIndentWidth: 4
+ColumnLimit: 80
+BreakBeforeBraces: Allman
+PointerAlignment:      Right
+DerivePointerAlignment: true
+SpaceBeforeAssignmentOperators: true
+SpaceAfterLogicalNot:           false
+SpaceAroundPointerQualifiers:   Default
+SpaceBeforeParens:              ControlStatements
+SpaceAfterCStyleCast:           false
+SpacesInSquareBrackets:         false
+SpacesInParens:                 Never
+SpacesInAngles:                 Never
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine:        false
+AllowShortFunctionsOnASingleLine:    None
+AllowShortBlocksOnASingleLine:       Never
+AllowShortCaseLabelsOnASingleLine:   false
+MaxEmptyLinesToKeep: 1
+AlignConsecutiveDeclarations:
+  Enabled: true
+AlignConsecutiveAssignments:
+  Enabled: false
+AlwaysBreakAfterReturnType:           None
+AlwaysBreakAfterDefinitionReturnType: None
+BreakBeforeBinaryOperators:  All
+BreakBeforeTernaryOperators: true
+SortIncludes:  Never
+IncludeBlocks: Preserve
+IndentPPDirectives: None
+BinPackArguments:                          false
+BinPackParameters:                         false
+AllowAllArgumentsOnNextLine:               false
+AllowAllParametersOfDeclarationOnNextLine: false
+PenaltyBreakAssignment:               100
+PenaltyBreakBeforeFirstCallParameter: 100
+PenaltyExcessCharacter:               1000
+PenaltyReturnTypeOnItsOwnLine:        10000
