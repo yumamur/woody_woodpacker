@@ -125,8 +125,17 @@ const char *conv_p_flags(Elf32_Word flags)
 
 int is_valid_elf(const uint8_t *data, const size_t size)
 {
-	return (size >= EI_NIDENT && memcmp(data, ELFMAG, SELFMAG) == 0
-			&& (data[EI_CLASS] == ELFCLASS32 || data[EI_CLASS] == ELFCLASS64)
-			&& (data[EI_DATA] == ELFDATA2LSB || data[EI_DATA] == ELFDATA2MSB)
-			&& data[EI_VERSION] == EV_CURRENT);
+	size_t ehsize;
+
+	if (size < EI_NIDENT || memcmp(data, ELFMAG, SELFMAG) != 0
+		|| data[EI_VERSION] != EV_CURRENT
+		|| (data[EI_DATA] != ELFDATA2LSB && data[EI_DATA] != ELFDATA2MSB))
+		return (0);
+	if (data[EI_CLASS] == ELFCLASS64)
+		ehsize = sizeof(Elf64_Ehdr);
+	else if (data[EI_CLASS] == ELFCLASS32)
+		ehsize = sizeof(Elf32_Ehdr);
+	else
+		return (0);
+	return (size >= ehsize);
 }

@@ -1,3 +1,4 @@
+#include "chacha20.h"
 #include "elf_utils.h"
 #include "stub.h"
 #include <string.h>
@@ -8,13 +9,68 @@ int in_bounds(t_file *f, uint64_t offset, uint64_t len)
 	return (offset < f->size && offset + len <= f->size);
 }
 
-/**
- * Copy the stub into the reserved slot and patch its jump-back delta
- */
-static int fill_stub(uint8_t *slot, uint64_t stub_vaddr, uint64_t orig_entry)
+/* read/write loops that tolerate short transfers. */
+static int full_read(int fd, void *buf, size_t n)
 {
-	const uint64_t marker = STUB_DELTA_PLACEHOLDER;
-	const int64_t  delta = (int64_t)orig_entry - (int64_t)stub_vaddr;
+	size_t	off = 0;
+	ssize_t r;
+
+	while (off < n)
+	{
+		r = read(fd, (char *)buf + off, n - off);
+		if (r <= 0)
+			return (-1);
+		off += (size_t)r;
+	}
+	return (0);
+}
+
+static int full_write(int fd, const void *buf, size_t n)
+{
+	size_t	off = 0;
+	ssize_t w;
+
+	while (off < n)
+	{
+		w = write(fd, (const char *)buf + off, n - off);
+		if (w <= 0)
+			return (-1);
+		off += (size_t)w;
+	}
+	return (0);
+}
+
+static int full_pwrite(int fd, const void *buf, size_t n, off_t pos)
+{
+	size_t	off = 0;
+	ssize_t w;
+
+	while (off < n)
+	{
+		w = pwrite(fd, (const char *)buf + off, n - off, pos + (off_t)off);
+		if (w <= 0)
+			return (-1);
+		off += (size_t)w;
+	}
+	return (0);
+}
+
+/**
+ * Copy the stub into the reserved slot and fill its parameter block:
+ * 1- The jump-back delta
+ * 2- the region to decrypt (start delta + length)
+ * 3- The ChaCha key/nonce.
+ * The region starts at the original entry, so its start delta is the same as
+ * the jump-back delta.
+ */
+static int fill_stub(t_file *f, uint64_t stub_vaddr)
+{
+	const Elf64_Ehdr *oeh = (const Elf64_Ehdr *)f->data;
+	const uint64_t	  magic = STUB_PARAMS_MAGIC;
+	const int64_t	  delta = (int64_t)oeh->e_entry - (int64_t)stub_vaddr;
+	uint8_t			 *slot = f->append;
+	uint8_t			 *p;
+	size_t			  i;
 
 	if (stub_bin_len > STUB_SIZE)
 		return (fprintf(stderr,
@@ -23,10 +79,18 @@ static int fill_stub(uint8_t *slot, uint64_t stub_vaddr, uint64_t orig_entry)
 						(unsigned long)STUB_SIZE),
 				-1);
 	memcpy(slot, stub_bin, stub_bin_len);
-	for (size_t i = 0; i + sizeof(marker) <= stub_bin_len; i++)
-		if (memcmp(slot + i, &marker, sizeof(marker)) == 0)
-			return (memcpy(slot + i, &delta, sizeof(delta)), 0);
-	return (fprintf(stderr, "stub delta placeholder not found\n"), -1);
+	for (i = 0; i + sizeof(magic) <= stub_bin_len; i++)
+		if (memcmp(slot + i, &magic, sizeof(magic)) == 0)
+			break;
+	if (i + sizeof(magic) > stub_bin_len)
+		return (fprintf(stderr, "stub params magic not found\n"), -1);
+	p = slot + i;
+	memcpy(p + STUB_P_ENTRY_DELTA, &delta, sizeof(delta));
+	memcpy(p + STUB_P_REGION_DELTA, &delta, sizeof(delta));
+	memcpy(p + STUB_P_REGION_LEN, &f->enc_len, sizeof(f->enc_len));
+	memcpy(p + STUB_P_KEY, f->key, sizeof(f->key));
+	memcpy(p + STUB_P_NONCE, f->nonce, sizeof(f->nonce));
+	return (0);
 }
 
 static void add_patch(t_file *f, size_t off, const void *buf, size_t len)
@@ -49,6 +113,71 @@ static int find_phnote_index64(t_file *f)
 	return (-1);
 }
 
+/* The PT_LOAD with PF_X (executable) flag contains the original entry point. */
+static const Elf64_Phdr *find_exec_load64(t_file *f, uint64_t entry)
+{
+	const Elf64_Ehdr *eh = (const Elf64_Ehdr *)f->data;
+	const Elf64_Phdr *ph = (const Elf64_Phdr *)(f->data + eh->e_phoff);
+
+	for (Elf64_Half i = 0; i < eh->e_phnum; i++)
+		if (ph[i].p_type == PT_LOAD && (ph[i].p_flags & PF_X)
+			&& entry >= ph[i].p_vaddr && entry < ph[i].p_vaddr + ph[i].p_filesz)
+			return (&ph[i]);
+	return (NULL);
+}
+
+/* Random 256-bit key + 96-bit nonce from /dev/urandom. */
+static int gen_key(t_file *f)
+{
+	const int fd = open("/dev/urandom", O_RDONLY);
+
+	if (fd < 0)
+		return (perror("/dev/urandom"), -1);
+	if (full_read(fd, f->key, sizeof(f->key))
+		|| full_read(fd, f->nonce, sizeof(f->nonce)))
+		return (perror("/dev/urandom read"), close(fd), -1);
+	close(fd);
+	printf("key_value: ");
+	for (size_t i = 0; i < sizeof(f->key); i++)
+		printf("%02X", f->key[i]);
+	printf("\n");
+	fflush(stdout);
+	return (0);
+}
+
+/*
+ * Encrypt from the original entry to the end of its executable
+ * segment. Starting at the entry keeps us clear of the ELF header and
+ * of anything the loader/ld.so consult before reaching us.
+ */
+static int encrypt_region64(t_file *f)
+{
+	const Elf64_Ehdr *oeh = (const Elf64_Ehdr *)f->data;
+	const uint64_t	  entry = oeh->e_entry;
+	const Elf64_Phdr *seg = find_exec_load64(f, entry);
+	size_t			  seg_end;
+
+	if (!seg)
+		return (fprintf(stderr, "no executable segment for entry\n"), -1);
+	f->enc_off = entry - seg->p_vaddr + seg->p_offset;
+	seg_end = seg->p_offset + seg->p_filesz;
+	if (f->enc_off >= seg_end
+		|| !in_bounds(f, f->enc_off, seg_end - f->enc_off))
+		return (fprintf(stderr, "bad code region\n"), -1);
+	f->enc_len = seg_end - f->enc_off;
+	f->enc = malloc(f->enc_len);
+	if (!f->enc)
+		return (perror("malloc"), -1);
+	memcpy(f->enc, f->data + f->enc_off, f->enc_len);
+	chacha20_xor(f->key, f->nonce, 0, f->enc, f->enc_len);
+	fprintf(stderr,
+			"[woody] encrypt file[%#zx..%#zx) len=%#zx\n",
+			f->enc_off,
+			seg_end,
+			f->enc_len);
+	return (0);
+}
+
 static int inject_note64(t_file	 *f,
 						 int	  note,
 						 size_t	  stub_off,
@@ -63,7 +192,7 @@ static int inject_note64(t_file	 *f,
 	if (!f->append)
 		return (perror("calloc"), -1);
 	f->append_len = STUB_SIZE;
-	if (fill_stub(f->append, stub_vaddr, oeh->e_entry))
+	if (fill_stub(f, stub_vaddr))
 		return (-1);
 	ph.p_type = PT_LOAD;
 	ph.p_flags = PF_R | PF_X;
@@ -90,13 +219,11 @@ static int inject_newphdr64(t_file *f, size_t stub_off, uint64_t stub_vaddr)
 	const size_t	  seg_size = STUB_SIZE + newtab_bytes;
 	const uint64_t	  phtab_vaddr = stub_vaddr + STUB_SIZE;
 
-	if (oeh->e_phentsize != sizeof(Elf64_Phdr))
-		return (fprintf(stderr, "unexpected e_phentsize\n"), -1);
 	f->append = calloc(1, seg_size);
 	if (!f->append)
 		return (perror("calloc"), -1);
 	f->append_len = seg_size;
-	if (fill_stub(f->append, stub_vaddr, oeh->e_entry))
+	if (fill_stub(f, stub_vaddr))
 		return (-1);
 	Elf64_Phdr *nt = (Elf64_Phdr *)(f->append + STUB_SIZE);
 	memcpy(nt, f->data + oeh->e_phoff, (size_t)phnum * sizeof(Elf64_Phdr));
@@ -135,9 +262,11 @@ static int inject64(t_file *f)
 	const uint64_t stub_vaddr = STUB_VADDR_BASE + stub_off;
 	int			   note;
 
-	if (eh->e_phnum == 0
+	if (eh->e_phnum == 0 || eh->e_phentsize != sizeof(Elf64_Phdr)
 		|| !in_bounds(f, eh->e_phoff, (uint64_t)eh->e_phentsize * eh->e_phnum))
 		return (fprintf(stderr, "who makes these files?\n"), -1);
+	if (gen_key(f) || encrypt_region64(f))
+		return (-1);
 	note = find_phnote_index64(f);
 	// hijack a PT_NOTE entry into an R+X PT_LOAD
 	if (note >= 0)
@@ -183,16 +312,44 @@ int write_woody(t_file *f)
 
 	if (fd == -1)
 		return (perror("No can do"), -1);
-	if (write(fd, f->data, f->size) != (ssize_t)f->size)
+	if (full_write(fd, f->data, f->size))
 		return (perror("write"), close(fd), -1);
-	if (f->append_len
-		&& write(fd, f->append, f->append_len) != (ssize_t)f->append_len)
+	if (f->append_len && full_write(fd, f->append, f->append_len))
 		return (perror("write append"), close(fd), -1);
 	for (int i = 0; i < f->npatch; i++)
-		if (pwrite(fd, f->patch[i].buf, f->patch[i].len, f->patch[i].off)
-			!= (ssize_t)f->patch[i].len)
+		if (full_pwrite(fd,
+						f->patch[i].buf,
+						f->patch[i].len,
+						(off_t)f->patch[i].off))
 			return (perror("pwrite patch"), close(fd), -1);
+	if (f->enc && full_pwrite(fd, f->enc, f->enc_len, (off_t)f->enc_off))
+		return (perror("pwrite enc"), close(fd), -1);
 	close(fd);
+	return (0);
+}
+
+/* Used to refuse overwriting the input with "woody" */
+static int same_file(const char *a, const char *b)
+{
+	struct stat sa;
+	struct stat sb;
+
+	if (stat(a, &sa) != 0 || stat(b, &sb) != 0)
+		return (0);
+	return (sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino);
+}
+
+/* Our products carry the stub's parameter-block magic in the clear, meaning
+ * we already packed said file. So we refuse rather than onion packing. */
+static int already_packed(const t_file *f)
+{
+	const uint64_t magic = STUB_PARAMS_MAGIC;
+
+	if (f->size < sizeof(magic))
+		return (0);
+	for (size_t i = 0; i + sizeof(magic) <= f->size; i++)
+		if (memcmp(f->data + i, &magic, sizeof(magic)) == 0)
+			return (1);
 	return (0);
 }
 
@@ -205,13 +362,25 @@ int main(int argc, char *argv[])
 		return (fprintf(stderr, "usage: %s <elf>\n", argv[0]), 1);
 	if (get_valid_file(argv[1], &f))
 		return (1);
-	if (f.is64)
+	if (same_file(argv[1], "woody"))
+		return (fprintf(stderr, "input and output (woody) are the same file\n"),
+				munmap(f.data, f.size),
+				1);
+	if (already_packed(&f))
+		return (fprintf(stderr,
+						"input is already packed by woody_woodpacker\n"),
+				munmap(f.data, f.size),
+				1);
+	if (f.swap)
+		rc = (fprintf(stderr, "big-endian ELF not supported\n"), -1);
+	else if (f.is64)
 		rc = inject64(&f);
 	else
 		rc = (fprintf(stderr, "32-bit injection not implemented yet\n"), -1);
 	if (rc == 0)
 		rc = write_woody(&f);
 	free(f.append);
+	free(f.enc);
 	munmap(f.data, f.size);
 	return (rc ? 1 : 0);
 }

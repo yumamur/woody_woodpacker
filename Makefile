@@ -3,8 +3,10 @@ NAME		= woody_woodpacker
 CC			= gcc
 CFLAGS		= -Wall -Wextra -Werror
 NASM		= nasm
+# SSE2 ChaCha20 stub by default; `make STUBDEF=` builds the scalar reference
+STUBDEF		= -DUSE_SSE2
 
-SRC			= main.c elf.c
+SRC			= main.c elf.c chacha20.c
 OBJDIR		= obj
 OBJ			= $(SRC:%.c=$(OBJDIR)/%.o)
 
@@ -15,7 +17,7 @@ STUB_HDR	= stub.h
 all: $(NAME)
 
 $(STUB_BIN): $(STUB_ASM)
-	$(NASM) -f bin $< -o $@
+	$(NASM) -f bin $(STUBDEF) $< -o $@
 
 $(STUB_HDR): $(STUB_BIN)
 	xxd -i $(STUB_BIN) > $(STUB_HDR)
@@ -35,7 +37,7 @@ asan: CFLAGS += -g -fsanitize=address
 asan: clean all
 
 clean:
-	rm -f $(OBJ) $(STUB_BIN) $(STUB_HDR)
+	rm -fr $(OBJDIR) $(STUB_BIN) $(STUB_HDR)
 
 fclean: clean
 	rm -f $(NAME) woody

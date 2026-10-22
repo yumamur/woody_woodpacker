@@ -28,6 +28,15 @@ typedef struct s_file
 	int		 npatch;
 	uint8_t *append;
 	size_t	 append_len;
+
+	/* encrypted code region, a large malloc'd override pwritten at enc_off */
+	uint8_t *enc;
+	size_t	 enc_off;
+	size_t	 enc_len;
+
+	/* ChaCha20 secret, will be embedded into the stub so woody self-decrypts */
+	uint8_t key[32];
+	uint8_t nonce[12];
 } t_file;
 
 #define _swap16(_swap, v) ((uint16_t)!_swap ? v : ((v >> 8) | (v << 8)))
@@ -42,10 +51,17 @@ typedef struct s_file
 					  : (((uint64_t)_swap32((uint32_t)v) << 32)                \
 						 | _swap32((uint32_t)(v >> 32))))
 
-#define STUB_SIZE 0x100UL
+#define STUB_SIZE 0x1000UL
 #define STUB_VADDR_BASE 0x4000000UL
 #define PAGE 0x1000UL
-#define STUB_DELTA_PLACEHOLDER 0xDEADBEEFCAFEC0DEULL
+/** 8-byte magic (see stub/stub.asm)
+ * the packer locates it and fills the fields at these fixed byte offsets. */
+#define STUB_PARAMS_MAGIC 0xDECAFFC0FFEEBABE
+#define STUB_P_ENTRY_DELTA 8
+#define STUB_P_REGION_DELTA 16
+#define STUB_P_REGION_LEN 24
+#define STUB_P_KEY 32
+#define STUB_P_NONCE 64
 
 int is_valid_elf(const uint8_t *data, const size_t size);
 
