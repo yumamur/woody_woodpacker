@@ -9,3 +9,4 @@
 !stub/*.asm
 stub.h
 !test/
+!test/**.sh
