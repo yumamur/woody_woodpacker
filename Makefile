@@ -6,13 +6,25 @@ NASM		= nasm
 # SSE2 ChaCha20 stub by default; `make STUBDEF=` builds the scalar reference
 STUBDEF		= -DUSE_SSE2
 
-SRC			= main.c elf.c chacha20.c lz4.c
+SRC			= main.c elf.c pe.c chacha20.c lz4.c
 OBJDIR		= obj
 OBJ			= $(SRC:%.c=$(OBJDIR)/%.o)
 
 STUB_ASM	= stub/stub.asm
 STUB_BIN	= stub.bin
 STUB_HDR	= stub.h
+
+STUB32_ASM	= stub/stub32.asm
+STUB32_BIN	= stub32.bin
+STUB32_HDR	= stub32.h
+
+STUBPE_ASM	= stub/stubpe64.asm
+STUBPE_BIN	= stubpe64.bin
+STUBPE_HDR	= stubpe64.h
+
+STUBPE32_ASM = stub/stubpe32.asm
+STUBPE32_BIN = stubpe32.bin
+STUBPE32_HDR = stubpe32.h
 
 all: $(NAME)
 
@@ -28,7 +40,22 @@ $(STUB32_BIN): $(STUB32_ASM)
 $(STUB32_HDR): $(STUB32_BIN)
 	xxd -i $(STUB32_BIN) > $(STUB32_HDR)
 
+$(STUBPE_BIN): $(STUBPE_ASM)
+	$(NASM) -f bin $(STUBDEF) $< -o $@
+
+$(STUBPE_HDR): $(STUBPE_BIN)
+	xxd -i $(STUBPE_BIN) > $(STUBPE_HDR)
+
+$(STUBPE32_BIN): $(STUBPE32_ASM)
+	$(NASM) -f bin $< -o $@
+
+$(STUBPE32_HDR): $(STUBPE32_BIN)
+	xxd -i $(STUBPE32_BIN) > $(STUBPE32_HDR)
+
 $(OBJDIR)/elf.o: elf.c $(STUB_HDR) $(STUB32_HDR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJDIR)/pe.o: pe.c $(STUBPE_HDR) $(STUBPE32_HDR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OBJDIR)/%.o: %.c
@@ -44,7 +71,8 @@ asan: CFLAGS += -g -fsanitize=address
 asan: clean all
 
 clean:
-	rm -fr $(OBJDIR) $(STUB_BIN) $(STUB_HDR) $(STUB32_BIN) $(STUB32_HDR)
+	rm -fr $(OBJDIR) $(STUB_BIN) $(STUB_HDR) $(STUB32_BIN) $(STUB32_HDR) \
+		$(STUBPE_BIN) $(STUBPE_HDR) $(STUBPE32_BIN) $(STUBPE32_HDR)
 
 fclean: clean
 	rm -f $(NAME) woody

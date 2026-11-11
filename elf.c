@@ -1,5 +1,6 @@
 #include "elf_utils.h"
 #include "stub.h"
+#include "stub32.h"
 #include <string.h>
 
 int in_bounds(t_file *f, uint64_t offset, uint64_t len)
@@ -232,6 +233,7 @@ static int fill_stub(uint8_t *slot,
 	memcpy(p + STUB_P_COMP_LEN, &f->comp_len, sizeof(f->comp_len));
 	memcpy(p + STUB_P_KEY, f->key, sizeof(f->key));
 	memcpy(p + STUB_P_NONCE, f->nonce, sizeof(f->nonce));
+	p[STUB_P_ANTIDBG] = f->anti_debug ? 1 : 0;
 	return (0);
 }
 
@@ -343,7 +345,17 @@ static int plan_layout64(t_file *f, t_layout *lo)
 		lo->blob_off = (size_t)ALIGN_UP(lo->phtab_off + lo->tab_bytes, PAGE);
 	}
 	f->out_len = lo->blob_off + f->comp_len;
-	lo->stub_vaddr = STUB_VADDR_BASE + lo->stub_off;
+	/* Place the stub segment above every original PT_LOAD so its R+X pages can
+	 * never be overlaid by an original (possibly RW) segment -- a fixed base is
+	 * not enough, since a large binary's vaddrs can climb past it. Keeping the
+	 * base page-aligned preserves p_vaddr == p_offset (mod PAGE) for any
+	 * stub_off, so only the in-page part of stub_off is carried over. */
+	uint64_t max_vend = STUB_VADDR_BASE;
+	for (Elf64_Half i = 0; i < lo->phnum; i++)
+		if (oph[i].p_type == PT_LOAD
+			&& oph[i].p_vaddr + oph[i].p_memsz > max_vend)
+			max_vend = oph[i].p_vaddr + oph[i].p_memsz;
+	lo->stub_vaddr = ALIGN_UP(max_vend, PAGE) + (lo->stub_off & (PAGE - 1));
 	lo->phtab_vaddr = lo->stub_vaddr + (lo->phtab_off - lo->stub_off);
 	return (0);
 }
@@ -416,7 +428,9 @@ static int emit_output64(t_file *f, const t_layout *lo)
 	eh->e_shoff = 0;
 	eh->e_shnum = 0;
 	eh->e_shstrndx = 0;
-	memcpy(out + WOODY_MARK_OFF, WOODY_MARK, WOODY_MARK_LEN); /* re-pack guard */
+	memcpy(out + WOODY_MARK_OFF,
+		   WOODY_MARK,
+		   WOODY_MARK_LEN); /* re-pack guard */
 
 	if (fill_stub(out + lo->stub_off,
 				  lo->stub_vaddr,
@@ -501,18 +515,349 @@ static int build_output64(t_file *f)
 	return (emit_output64(f, &lo));
 }
 
-static const t_elf_ops g_elf64 = {
+/* =========================== 32-bit packing =========================== */
+/* Mostly the same, just the stub and some widths differ */
+
+static int find_phnote_index32(t_file *f)
+{
+	const Elf32_Ehdr *eh = (Elf32_Ehdr *)f->data;
+	const Elf32_Phdr *ph = (Elf32_Phdr *)(f->data + eh->e_phoff);
+
+	for (Elf32_Half i = 0; i < eh->e_phnum; i++)
+		if (ph[i].p_type == PT_NOTE)
+			return (i);
+	return (-1);
+}
+
+static const Elf32_Phdr *find_exec_load32(t_file *f, uint32_t entry)
+{
+	const Elf32_Ehdr *eh = (const Elf32_Ehdr *)f->data;
+	const Elf32_Phdr *ph = (const Elf32_Phdr *)(f->data + eh->e_phoff);
+
+	for (Elf32_Half i = 0; i < eh->e_phnum; i++)
+		if (ph[i].p_type == PT_LOAD && (ph[i].p_flags & PF_X)
+			&& entry >= ph[i].p_vaddr && entry < ph[i].p_vaddr + ph[i].p_filesz)
+			return (&ph[i]);
+	return (NULL);
+}
+
+static int is_pie_executable32(t_file *f)
+{
+	const Elf32_Ehdr *eh = (const Elf32_Ehdr *)f->data;
+	const Elf32_Phdr *ph;
+
+	if (eh->e_type == ET_EXEC)
+		return (1);
+	if (eh->e_type != ET_DYN || eh->e_phentsize != sizeof(Elf32_Phdr)
+		|| !in_bounds(f, eh->e_phoff, (uint64_t)eh->e_phentsize * eh->e_phnum))
+		return (0);
+	ph = (const Elf32_Phdr *)(f->data + eh->e_phoff);
+	for (Elf32_Half i = 0; i < eh->e_phnum; i++)
+	{
+		const Elf32_Dyn *dyn;
+		size_t			 n;
+
+		if (ph[i].p_type != PT_DYNAMIC
+			|| !in_bounds(f, ph[i].p_offset, ph[i].p_filesz))
+			continue;
+		dyn = (const Elf32_Dyn *)(f->data + ph[i].p_offset);
+		n = ph[i].p_filesz / sizeof(Elf32_Dyn);
+		for (size_t j = 0; j < n && dyn[j].d_tag != DT_NULL; j++)
+			if (dyn[j].d_tag == DT_FLAGS_1)
+				return ((dyn[j].d_un.d_val & DF_1_PIE) != 0);
+		return (0);
+	}
+	return (0);
+}
+
+static int fill_stub32(uint8_t *slot,
+					   uint32_t stub_vaddr,
+					   uint32_t src_delta,
+					   t_file  *f)
+{
+	const uint64_t magic = STUB_PARAMS_MAGIC;
+	const int32_t  delta = (int32_t)((uint32_t)f->entry - stub_vaddr);
+	const uint32_t rlen = (uint32_t)f->region_len;
+	const uint32_t clen = (uint32_t)f->comp_len;
+	size_t		   i;
+	uint8_t		  *p;
+
+	memcpy(slot, stub32_bin, stub32_bin_len);
+	for (i = 0; i + sizeof(magic) <= stub32_bin_len; i++)
+		if (memcmp(slot + i, &magic, sizeof(magic)) == 0)
+			break;
+	if (i + sizeof(magic) > stub32_bin_len)
+		return (fprintf(stderr, "stub32 params magic not found\n"), -1);
+	p = slot + i;
+	memcpy(p + STUB32_P_ENTRY_DELTA, &delta, sizeof(delta));
+	memcpy(p + STUB32_P_REGION_DELTA, &delta, sizeof(delta));
+	memcpy(p + STUB32_P_REGION_LEN, &rlen, sizeof(rlen));
+	memcpy(p + STUB32_P_SRC_DELTA, &src_delta, sizeof(src_delta));
+	memcpy(p + STUB32_P_COMP_LEN, &clen, sizeof(clen));
+	memcpy(p + STUB32_P_KEY, f->key, sizeof(f->key));
+	memcpy(p + STUB32_P_NONCE, f->nonce, sizeof(f->nonce));
+	p[STUB32_P_ANTIDBG] = f->anti_debug ? 1 : 0;
+	return (0);
+}
+
+static void patch_phdr32(Elf32_Phdr *p, uint64_t cut_end, uint64_t K, t_file *f)
+{
+	if (p->p_offset >= cut_end)
+		p->p_offset -= (uint32_t)K;
+	if (p->p_type == PT_LOAD && (p->p_flags & PF_X) && f->entry >= p->p_vaddr
+		&& f->entry < p->p_vaddr + p->p_memsz)
+		p->p_filesz = (uint32_t)f->region_off - p->p_offset; /* region -> bss */
+}
+
+static void set_stub_phdr32(Elf32_Phdr *p,
+							uint32_t	vaddr,
+							size_t		off,
+							size_t		sz)
+{
+	p->p_type = PT_LOAD;
+	p->p_flags = PF_R | PF_X; /* X is for the stub; the blob just shares it */
+	p->p_offset = (uint32_t)off;
+	p->p_vaddr = vaddr;
+	p->p_paddr = vaddr;
+	p->p_filesz = (uint32_t)sz;
+	p->p_memsz = (uint32_t)sz;
+	p->p_align = PAGE;
+}
+
+static int plan_layout32(t_file *f, t_layout *lo)
+{
+	const Elf32_Ehdr *oeh = (const Elf32_Ehdr *)f->data;
+	const Elf32_Phdr *oph = (const Elf32_Phdr *)(f->data + oeh->e_phoff);
+	size_t			  pre_stub;
+
+	lo->note = find_phnote_index32(f);
+	lo->phnum = oeh->e_phnum;
+	lo->newphnum = (lo->note >= 0) ? lo->phnum : (Elf32_Half)(lo->phnum + 1);
+	lo->seg_end = f->region_off + f->region_len;
+	lo->cut_start = ALIGN_UP(f->region_off, PAGE);
+	lo->cut_end = ALIGN_DOWN(lo->seg_end, PAGE);
+	if (oeh->e_phoff >= lo->cut_start && lo->cut_start)
+		return (fprintf(stderr, "phdr table inside cut window\n"), -1);
+	lo->K = (lo->cut_end > lo->cut_start) ? (lo->cut_end - lo->cut_start) : 0;
+	for (Elf32_Half i = 0; lo->K && i < lo->phnum; i++)
+	{
+		if (i == (Elf32_Half)lo->note)
+			continue;
+		if (oph[i].p_offset >= lo->cut_start && oph[i].p_offset < lo->cut_end)
+		{
+			lo->K = 0;
+			break;
+		}
+	}
+	if (!lo->K)
+		lo->cut_start = lo->cut_end = 0;
+	lo->kept_end = 0;
+	for (Elf32_Half i = 0; i < lo->phnum; i++)
+	{
+		if (oph[i].p_type == PT_LOAD
+			&& oph[i].p_offset + oph[i].p_filesz > lo->kept_end)
+			lo->kept_end = oph[i].p_offset + oph[i].p_filesz;
+	}
+
+	pre_stub = (size_t)(lo->cut_start + (lo->kept_end - lo->cut_end));
+	lo->stub_off = (size_t)ALIGN_UP(pre_stub, 8);
+	lo->tab_bytes = (size_t)lo->newphnum * sizeof(Elf32_Phdr);
+	if (lo->note >= 0)
+	{
+		lo->phtab_off = oeh->e_phoff;
+		lo->blob_off = (size_t)ALIGN_UP(lo->stub_off + stub32_bin_len, PAGE);
+	}
+	else
+	{
+		lo->phtab_off = (size_t)ALIGN_UP(lo->stub_off + stub32_bin_len, 8);
+		lo->blob_off = (size_t)ALIGN_UP(lo->phtab_off + lo->tab_bytes, PAGE);
+	}
+	f->out_len = lo->blob_off + f->comp_len;
+	/* Same rule as 64-bit: sit the stub above every original PT_LOAD, keeping a
+	 * page-aligned base so p_vaddr == p_offset (mod PAGE) still holds. */
+	uint32_t max_vend = STUB_VADDR_BASE;
+	for (Elf32_Half i = 0; i < lo->phnum; i++)
+		if (oph[i].p_type == PT_LOAD
+			&& oph[i].p_vaddr + oph[i].p_memsz > max_vend)
+			max_vend = oph[i].p_vaddr + oph[i].p_memsz;
+	lo->stub_vaddr = ALIGN_UP(max_vend, PAGE) + (lo->stub_off & (PAGE - 1));
+	lo->phtab_vaddr = lo->stub_vaddr + (lo->phtab_off - lo->stub_off);
+	return (0);
+}
+
+static int emit_output32(t_file *f, const t_layout *lo)
+{
+	uint8_t	   *out;
+	Elf32_Ehdr *eh;
+	Elf32_Phdr *ph;
+
+	out = calloc(1, f->out_len);
+	if (!out)
+		return (perror("calloc"), -1);
+	memcpy(out, f->data, lo->cut_start);
+	memcpy(out + lo->cut_start,
+		   f->data + lo->cut_end,
+		   lo->kept_end - lo->cut_end);
+	if (!lo->K)
+		memset(out + f->region_off, 0, (size_t)(lo->seg_end - f->region_off));
+	else
+	{
+		if (lo->cut_start > f->region_off)
+			memset(out + f->region_off,
+				   0,
+				   (size_t)(lo->cut_start - f->region_off));
+		if (lo->seg_end > lo->cut_end)
+			memset(out + lo->cut_start, 0, (size_t)(lo->seg_end - lo->cut_end));
+	}
+
+	eh = (Elf32_Ehdr *)out;
+	if (lo->note >= 0)
+	{
+		ph = (Elf32_Phdr *)(out + eh->e_phoff);
+		for (Elf32_Half i = 0; i < lo->phnum; i++)
+			patch_phdr32(&ph[i], lo->cut_end, lo->K, f);
+		set_stub_phdr32(&ph[lo->note],
+						(uint32_t)lo->stub_vaddr,
+						lo->stub_off,
+						f->out_len - lo->stub_off);
+	}
+	else
+	{
+		ph = (Elf32_Phdr *)(out + lo->phtab_off);
+		memcpy(ph, out + eh->e_phoff, (size_t)lo->phnum * sizeof(Elf32_Phdr));
+		for (Elf32_Half i = 0; i < lo->phnum; i++)
+		{
+			patch_phdr32(&ph[i], lo->cut_end, lo->K, f);
+			if (ph[i].p_type == PT_PHDR)
+			{
+				ph[i].p_offset = (uint32_t)lo->phtab_off;
+				ph[i].p_vaddr = (uint32_t)lo->phtab_vaddr;
+				ph[i].p_paddr = (uint32_t)lo->phtab_vaddr;
+				ph[i].p_filesz = (uint32_t)lo->tab_bytes;
+				ph[i].p_memsz = (uint32_t)lo->tab_bytes;
+			}
+		}
+		set_stub_phdr32(&ph[lo->phnum],
+						(uint32_t)lo->stub_vaddr,
+						lo->stub_off,
+						f->out_len - lo->stub_off);
+		eh->e_phoff = (uint32_t)lo->phtab_off;
+		eh->e_phnum = lo->newphnum;
+	}
+	eh->e_entry = (uint32_t)lo->stub_vaddr;
+	eh->e_shoff = 0;
+	eh->e_shnum = 0;
+	eh->e_shstrndx = 0;
+	memcpy(out + WOODY_MARK_OFF,
+		   WOODY_MARK,
+		   WOODY_MARK_LEN); /* re-pack guard */
+
+	if (fill_stub32(out + lo->stub_off,
+					(uint32_t)lo->stub_vaddr,
+					(uint32_t)(lo->blob_off - lo->stub_off),
+					f))
+		return (free(out), -1);
+	memcpy(out + lo->blob_off, f->blob, f->comp_len);
+	f->out = out;
+	fprintf(stderr,
+			"[woody] %s  cut=%#zx stub@%#zx  %#zx -> %#zx bytes\n",
+			lo->note >= 0 ? "PT_NOTE hijack"
+						  : "new PT_LOAD (phdr table relocated)",
+			(size_t)lo->K,
+			lo->stub_off,
+			f->size,
+			f->out_len);
+	return (0);
+}
+
+static int validate32(t_file *f)
+{
+	const Elf32_Ehdr *eh = (const Elf32_Ehdr *)f->data;
+
+	if (!is_pie_executable32(f))
+		return (
+			fprintf(stderr,
+					"not a packable executable (e_type=%u): shared objects, "
+					"relocatable and core files are unsupported\n",
+					eh->e_type),
+			-1);
+	if (eh->e_phnum == 0 || eh->e_phentsize != sizeof(Elf32_Phdr)
+		|| !in_bounds(f, eh->e_phoff, (uint64_t)eh->e_phentsize * eh->e_phnum))
+		return (fprintf(stderr, "malformed program header table\n"), -1);
+	return (0);
+}
+
+static int find_region32(t_file *f)
+{
+	const Elf32_Ehdr *oeh = (const Elf32_Ehdr *)f->data;
+	const uint32_t	  entry = oeh->e_entry;
+	const Elf32_Phdr *seg = find_exec_load32(f, entry);
+	uint32_t		  seg_end;
+
+	if (!seg)
+		return (fprintf(stderr, "no executable segment for entry\n"), -1);
+	f->region_off = entry - seg->p_vaddr + seg->p_offset;
+	seg_end = seg->p_offset + seg->p_filesz;
+	if (f->region_off >= seg_end
+		|| !in_bounds(f, f->region_off, seg_end - f->region_off))
+		return (fprintf(stderr, "bad code region\n"), -1);
+	f->region_len = seg_end - f->region_off;
+	f->entry = entry;
+	return (0);
+}
+
+static int build_output32(t_file *f)
+{
+	t_layout lo;
+
+	if (plan_layout32(f, &lo))
+		return (-1);
+	return (emit_output32(f, &lo));
+}
+
+/* Our output carries a marker in its e_ident padding (EI_PAD = index 9, which
+ * the kernel and ld.so ignore); if we see it, the file is already packed and we
+ * refuse rather than onion-packing. O(1) check. */
+static int is_packed_elf(const t_file *f)
+{
+	return (f->size >= EI_NIDENT
+			&& memcmp(f->data + WOODY_MARK_OFF, WOODY_MARK, WOODY_MARK_LEN)
+				   == 0);
+}
+
+static const t_file_ops g_elf64 = {
 	.name = "elf64",
 	.validate = validate64,
 	.find_region = find_region64,
 	.build_output = build_output64,
+	.is_packed = is_packed_elf,
 };
 
-const t_elf_ops *elf_select_ops(const t_file *f)
+static const t_file_ops g_elf32 = {
+	.name = "elf32",
+	.validate = validate32,
+	.find_region = find_region32,
+	.build_output = build_output32,
+	.is_packed = is_packed_elf,
+};
+
+const t_file_ops *elf_select_ops(const t_file *f)
 {
 	if (f->swap)
 		return (NULL); /* opposite-endian ELF: unsupported */
-	if (f->is64)
-		return (&g_elf64);
-	return (NULL); /* 32-bit: not implemented yet */
+	return (f->is64 ? &g_elf64 : &g_elf32);
+}
+
+/* Validate an already-mapped ELF and fill in the class/endianness fields the
+ * packing hooks rely on. Assumes f->data / f->size are set. */
+int elf_prepare(t_file *f)
+{
+	const uint16_t one = 1;
+
+	if (is_valid_elf(f->data, f->size) == 0)
+		return (fprintf(stderr, "file is not valid elf\n"), -1);
+	f->is64 = f->data[EI_CLASS] == ELFCLASS64;
+	f->swap = (f->data[EI_DATA] == ELFDATA2LSB)
+			  != (*(const uint8_t *)&one == 1);
+	return (0);
 }

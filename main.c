@@ -1,6 +1,7 @@
 #include "chacha20.h"
 #include "elf_utils.h"
 #include "lz4.h"
+#include "pe_utils.h"
 #include <string.h>
 #include <sys/mman.h>
 
@@ -34,17 +35,27 @@ static int full_write(int fd, const void *buf, size_t n)
 	return (0);
 }
 
-/* Random 256-bit key + 96-bit nonce from /dev/urandom. */
-static int gen_key(t_file *f)
+/* Fill buf with n cryptographically random bytes from /dev/urandom. */
+static int fill_random(void *buf, size_t n)
 {
 	const int fd = open("/dev/urandom", O_RDONLY);
 
 	if (fd < 0)
 		return (perror("/dev/urandom"), -1);
-	if (full_read(fd, f->key, sizeof(f->key))
-		|| full_read(fd, f->nonce, sizeof(f->nonce)))
+	if (full_read(fd, buf, n))
 		return (perror("/dev/urandom read"), close(fd), -1);
 	close(fd);
+	return (0);
+}
+
+static int gen_key(t_file *f, const uint8_t *user_key)
+{
+	if (user_key)
+		memcpy(f->key, user_key, sizeof(f->key));
+	else if (fill_random(f->key, sizeof(f->key)))
+		return (-1);
+	if (fill_random(f->nonce, sizeof(f->nonce)))
+		return (-1);
 	printf("key_value: ");
 	for (size_t i = 0; i < sizeof(f->key); i++)
 		printf("%02X", f->key[i]);
@@ -78,20 +89,52 @@ static int compress_encrypt(t_file *f)
 }
 
 /* The packing pipeline: the flavour-specific steps come from `ops`, the
- * class-agnostic key/compress/encrypt steps are shared. */
-static int pack(t_file *f, const t_elf_ops *ops)
+ * class-agnostic key/compress/encrypt steps are shared. `user_key` is the
+ * 32-byte key parsed from -k, or NULL to generate one at random. */
+static int pack(t_file *f, const t_file_ops *ops, const uint8_t *user_key)
 {
-	if (ops->validate(f) || gen_key(f) || ops->find_region(f)
+	if (ops->validate(f) || gen_key(f, user_key) || ops->find_region(f)
 		|| compress_encrypt(f) || ops->build_output(f))
 		return (-1);
 	return (0);
 }
 
-static int get_valid_file(char *filename, t_file *f)
+/* Decode one hex digit, or -1 if it is not one. */
+static int hex_val(int c)
 {
-	struct stat	   st;
-	const uint16_t one = 1;
-	const int	   fd = open(filename, O_RDONLY);
+	if (c >= '0' && c <= '9')
+		return (c - '0');
+	if (c >= 'a' && c <= 'f')
+		return (c - 'a' + 10);
+	if (c >= 'A' && c <= 'F')
+		return (c - 'A' + 10);
+	return (-1);
+}
+
+static int parse_hex_key(const char *s, uint8_t out[32])
+{
+	if (strlen(s) != 64)
+		return (fprintf(stderr,
+						"key must be exactly 64 hex digits (256-bit)\n"),
+				-1);
+	for (int i = 0; i < 32; i++)
+	{
+		const int hi = hex_val((unsigned char)s[2 * i]);
+		const int lo = hex_val((unsigned char)s[2 * i + 1]);
+
+		if (hi < 0 || lo < 0)
+			return (fprintf(stderr, "key contains a non-hex character\n"), -1);
+		out[i] = (uint8_t)((hi << 4) | lo);
+	}
+	return (0);
+}
+
+/* mmap the input read-only and record its size. Format detection (ELF vs PE)
+ * is the caller's job */
+static int map_file(const char *filename, t_file *f)
+{
+	struct stat st;
+	const int	fd = open(filename, O_RDONLY);
 
 	if (fd < 0 || fstat(fd, &st) < 0)
 		return (perror("can't open file"), -1);
@@ -101,14 +144,7 @@ static int get_valid_file(char *filename, t_file *f)
 	close(fd);
 	if (f->data == MAP_FAILED)
 		return (perror("couldn't mmap"), -1);
-	if (is_valid_elf(f->data, st.st_size) == 0)
-		return (fprintf(stderr, "file is not valid elf\n"),
-				munmap(f->data, st.st_size),
-				-1);
 	f->size = st.st_size;
-	f->is64 = f->data[EI_CLASS] == ELFCLASS64;
-	f->swap = (f->data[EI_DATA] == ELFDATA2LSB)
-			  != (*(const uint8_t *)&one == 1);
 	return (0);
 }
 
@@ -136,45 +172,107 @@ static int same_file(const char *a, const char *b)
 	return (sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino);
 }
 
-/* Our output carries a marker in its e_ident padding; if we see it, the file is
- * already packed and we refuse rather than onion-packing. O(1) check. */
-static int already_packed(const t_file *f)
+/* Parse argv into the input path and optional -k key. Returns 0 on success, or
+ * 1 after printing usage. On success *keyarg points at the raw hex key or NULL.
+ */
+static int parse_args(int		   argc,
+					  char		  *argv[],
+					  const char **path,
+					  const char **keyarg,
+					  int		  *anti)
 {
-	return (f->size >= EI_NIDENT
-			&& memcmp(f->data + WOODY_MARK_OFF, WOODY_MARK, WOODY_MARK_LEN) == 0);
+	const char *usage = "usage: %s [-k <hex256>] [-a] <elf>\n";
+
+	*path = NULL;
+	*keyarg = NULL;
+	*anti = 0;
+	for (int i = 1; i < argc; i++)
+	{
+		if (strcmp(argv[i], "-k") == 0)
+		{
+			if (++i >= argc)
+				return (fprintf(stderr, usage, argv[0]), 1);
+			*keyarg = argv[i];
+		}
+		else if (strcmp(argv[i], "-a") == 0)
+			*anti = 1;
+		else if (!*path)
+			*path = argv[i];
+		else
+			return (fprintf(stderr, usage, argv[0]), 1);
+	}
+	if (!*path)
+		return (fprintf(stderr, usage, argv[0]), 1);
+	return (0);
+}
+
+/* Container-specific prep + hook table selection, keyed on the detected format.
+ * Both PE (.exe) and ELF share the pack pipeline; only the entries here differ,
+ * so main's one real branch is picking which pair to use. */
+static void select_format(t_file *f,
+						  int (**prepare)(t_file *),
+						  const t_file_ops *(**select)(const t_file *))
+{
+	if (pe_detect(f->data, f->size))
+	{
+		*prepare = pe_prepare;
+		*select = pe_select_ops;
+	}
+	else
+	{
+		*prepare = elf_prepare;
+		*select = elf_select_ops;
+	}
+}
+
+/* The whole packing run once the input is mapped: detect the format, run the
+ * shared checks (self-overwrite, already-packed) through the hook table, pack,
+ * and write woody. Frees the owned buffers; the caller still owns the mapping.
+ * Returns 0 on success, -1 on any failure. */
+static int process(t_file *f, const char *path, const uint8_t *user_key)
+{
+	int (*prepare)(t_file *);
+	const t_file_ops *(*select)(const t_file *);
+	const t_file_ops *ops;
+	int				  rc;
+
+	select_format(f, &prepare, &select);
+	if (prepare(f))
+		return (-1);
+	if (same_file(path, "woody"))
+		return (fprintf(stderr, "input and output (woody) are the same file\n"),
+				-1);
+	ops = select(f);
+	if (!ops)
+		return (fprintf(stderr, "unsupported binary (opposite-endian ELF)\n"),
+				-1);
+	if (ops->is_packed(f))
+		return (fprintf(stderr, "input is already packed\n"), -1);
+	rc = pack(f, ops, user_key);
+	if (rc == 0)
+		rc = write_woody(f);
+	free(f->blob);
+	free(f->out);
+	return (rc);
 }
 
 int main(int argc, char *argv[])
 {
-	const t_elf_ops *ops;
-	t_file			 f = {0};
-	int				 rc;
+	t_file		f = {0};
+	const char *path;
+	const char *keyarg;
+	uint8_t		user_key[32];
+	int			anti;
+	int			rc;
 
-	if (argc != 2)
-		return (fprintf(stderr, "usage: %s <elf>\n", argv[0]), 1);
-	if (get_valid_file(argv[1], &f))
+	if (parse_args(argc, argv, &path, &keyarg, &anti))
 		return (1);
-	if (same_file(argv[1], "woody"))
-		return (fprintf(stderr, "input and output (woody) are the same file\n"),
-				munmap(f.data, f.size),
-				1);
-	if (already_packed(&f))
-		return (fprintf(stderr,
-						"input is already packed by woody_woodpacker\n"),
-				munmap(f.data, f.size),
-				1);
-	ops = elf_select_ops(&f);
-	if (!ops)
-		rc = (fprintf(stderr,
-					  "unsupported ELF class/endianness (32-bit and "
-					  "big-endian are not implemented yet)\n"),
-			  -1);
-	else
-		rc = pack(&f, ops);
-	if (rc == 0)
-		rc = write_woody(&f);
-	free(f.blob);
-	free(f.out);
+	if (keyarg && parse_hex_key(keyarg, user_key))
+		return (1);
+	if (map_file(path, &f))
+		return (1);
+	f.anti_debug = anti;
+	rc = process(&f, path, keyarg ? user_key : NULL);
 	munmap(f.data, f.size);
 	return (rc ? 1 : 0);
 }

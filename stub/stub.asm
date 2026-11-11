@@ -88,12 +88,73 @@ _start:
 	push    r15
 	sub     rsp, 128                ; [rsp+0..63]=working state, [rsp+64..127]=initial
 
+	; --- anti-analysis (optional, enabled by -a flag) ---
+	movzx   eax, byte [rel antidbg]
+	test    al, al
+	jz      .banner                 ; feature off -> always print the banner
+	sub     rsp, 2048               ; scratch buffer for the status file
+	lea     rdi, [rel proc_status]
+	xor     esi, esi                ; O_RDONLY
+	mov     eax, 2                  ; SYS_open
+	syscall
+	test    rax, rax
+	js      .banner_free            ; can't open -> print the banner
+	mov     r8, rax                 ; fd
+	mov     rdi, rax
+	mov     rsi, rsp
+	mov     edx, 2048
+	xor     eax, eax                ; SYS_read
+	syscall
+	mov     r9, rax                 ; bytes read
+	mov     rdi, r8
+	mov     eax, 3                  ; SYS_close
+	syscall
+	test    r9, r9
+	jle     .banner_free            ; read nothing -> print the banner
+	mov     r10, rsp                ; p = buf
+	mov     r11, rsp
+	add     r11, r9                 ; end = buf + n
+.ad_scan:
+	mov     rax, r11
+	sub     rax, r10
+	cmp     rax, 11                 ; need "TracerPid:" + one digit
+	jb      .banner_free            ; field not found -> print the banner
+	mov     rsi, r10
+	lea     rdi, [rel tracer_str]
+	mov     ecx, 10
+	repe    cmpsb                   ; DF=0 (cld above)
+	jne     .ad_next
+	mov     rsi, r10
+	add     rsi, 10                 ; first char after "TracerPid:"
+.ad_ws:
+	mov     al, [rsi]
+	cmp     al, 0x20                ; space
+	je      .ad_wsadv
+	cmp     al, 0x09                ; tab
+	jne     .ad_digit
+.ad_wsadv:
+	inc     rsi
+	jmp     .ad_ws
+.ad_digit:
+	cmp     al, '0'
+	jne     .ad_traced              ; non-zero TracerPid -> debugger present
+	jmp     .banner_free            ; '0' -> not traced -> print
+.ad_next:
+	inc     r10
+	jmp     .ad_scan
+.ad_traced:
+	add     rsp, 2048
+	jmp     .after_banner           ; traced: skip the banner entirely
+.banner_free:
+	add     rsp, 2048               ; release scratch, then print
+.banner:
 	; ....WOODY....
 	mov     rax, SYS_write
 	mov     rdi, 1
 	lea     rsi, [rel msg]
 	mov     rdx, msg_len
 	syscall
+.after_banner:
 
 	; initial ChaCha state at rsp+64
 	mov     dword [rsp+64+0*4], 0x61707865      ; constant (expa|nd 3|2-by|te k)
@@ -322,6 +383,12 @@ key:
 	times 32 db 0                   ; ChaCha key                    (+48)
 nonce:
 	times 12 db 0                   ; ChaCha nonce                  (+80)
+antidbg:
+	db      0                       ; 1 = run the TracerPid check   (+92)
 msg:
 	db      0x2e,0x2e,0x2e,0x2e,'W','O','O','D','Y',0x2e,0x2e,0x2e,0x2e,0x0a
 msg_len equ $ - msg
+proc_status:
+	db      "/proc/self/status", 0
+tracer_str:
+	db      "TracerPid:"
